@@ -45,6 +45,7 @@ export interface McpTool {
     title?: SdkTool["title"];
     description?: SdkTool["description"];
     inputSchema?: SdkTool["inputSchema"];
+    outputSchema?: SdkTool["outputSchema"];
     _meta?: SdkTool["_meta"];
 }
 export interface McpResource {
@@ -267,6 +268,8 @@ export interface ServerEntry {
     /** Explicit rmcp-mux Unix-domain socket path. Mutually exclusive with command and url. */
     socket?: string;
     env?: Record<string, string>;
+    /** Inherit the adapter process environment for stdio servers. Defaults to true; false keeps SDK platform defaults plus explicit env overlays. */
+    inheritEnv?: boolean;
     cwd?: string;
     url?: string;
     headers?: Record<string, string>;
@@ -464,6 +467,7 @@ export interface ToolMetadata {
     uiResourceUri?: string;
     uiVisibility?: UiToolVisibility[];
     inputSchema?: unknown;
+    outputSchema?: unknown;
     uiStreamMode?: UiStreamMode;
 }
 export interface PromptMetadata {
@@ -497,6 +501,7 @@ export interface CachedTool {
     name: string;
     description?: string;
     inputSchema?: unknown;
+    outputSchema?: unknown;
     uiResourceUri?: string;
     uiVisibility?: UiToolVisibility[];
     uiStreamMode?: "eager" | "stream-first";
