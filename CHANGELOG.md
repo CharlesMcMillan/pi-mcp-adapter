@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp({ connect })` now reports the direct tools it discovers on the tool result via `addedToolNames`, Pi's result-scoped tool activation surface, so they load from that transcript point instead of through an active-tool list rewrite. (#490) Thanks to [@chiptoe-svg](https://github.com/chiptoe-svg) for PR #494.
 
 ### Fixed
+- OAuth credential transactions now serialize across processes using kernel locks, release on failure and cancellation, and keep callback tokens bound to their issuing client. Optional `PI_MCP_OAUTH_LOG` diagnostics identify processes and transactions without logging credentials.
 - Session-scoped MCP tool approvals and MCP App iframe consent now persist on and restore from the active Pi session branch. (#492)
 - The `/mcp` panel no longer marks reconnects as cached when cache reload returns no entry, while preserving explicit zero-TTL behavior. Thanks to [@fyq163](https://github.com/fyq163) for #497.
 - MCP output truncation now uses Pi host truncation semantics and formatting while preserving MCP artifact spill behavior.

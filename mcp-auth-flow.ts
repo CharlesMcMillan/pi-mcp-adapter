@@ -12,6 +12,8 @@ import {
   type AuthOptions,
 } from "@modelcontextprotocol/client"
 import open from "open"
+import { authFetch } from "./mcp-auth-fetch.ts"
+export { createOAuthAwareFetch } from "./mcp-auth-fetch.ts"
 import {
   getOAuthCallbackPort,
   McpOAuthProvider,
@@ -27,8 +29,9 @@ import {
 } from "./mcp-callback-server.ts"
 import {
   getAuthForUrl,
+  getAuthEntry,
+  withAuthEntryTransaction,
   isTokenExpired,
-  hasStoredTokens,
   clearAllCredentials,
   clearClientInfo,
   clearCodeVerifier,
@@ -312,30 +315,6 @@ async function probeAuthDiscovery(serverUrl: string, definition?: ServerEntry, s
   }
 }
 
-/** Default timeout for each outbound HTTP request the SDK issues during OAuth. */
-const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 30_000
-const MAX_OAUTH_REQUEST_TIMEOUT_MS = 2_147_483_647
-
-function resolveOAuthRequestTimeoutMs(): number {
-  const raw = process.env.PI_MCP_OAUTH_REQUEST_TIMEOUT_MS
-  const parsed = raw === undefined ? Number.NaN : Number(raw)
-  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_OAUTH_REQUEST_TIMEOUT_MS ? parsed : DEFAULT_OAUTH_REQUEST_TIMEOUT_MS
-}
-
-/**
- * fetch bound to both the owning runtime/options signal and a per-request
- * timeout. The MCP SDK issues discovery, dynamic client registration,
- * token-exchange, and refresh requests through this during OAuth; without a
- * bound timeout a stalled endpoint hangs until the OS TCP timeout (~2 minutes).
- */
-function authFetch(signal: AbortSignal | undefined): (url: string | URL, init?: RequestInit) => Promise<Response> {
-  return (url, init) => {
-    const timeoutSignal = AbortSignal.timeout(resolveOAuthRequestTimeoutMs())
-    const combined = combineAbortSignals(signal, timeoutSignal, init?.signal ?? undefined)
-    return fetch(url, { ...init, ...(combined ? { signal: combined } : {}) })
-  }
-}
-
 type OAuthRedirectTarget =
   | {
     mode: "local"
@@ -444,12 +423,14 @@ export async function startAuth(
   throwIfAborted(signal)
 
   if (config.grantType === "client_credentials") {
-    const storedAuth = await getAuthForUrl(serverName, serverUrl, authStorageOptions)
-    if (storedAuth?.clientInfo && !storedAuth.tokens && !config.clientId) {
-      clearClientInfo(serverName, authStorageOptions)
-      clearCodeVerifier(serverName, authStorageOptions)
-      await clearOAuthState(serverName, authStorageOptions)
-    }
+    await withAuthEntryTransaction(serverName, async () => {
+      const storedAuth = getAuthForUrl(serverName, serverUrl, authStorageOptions)
+      if (storedAuth?.clientInfo && !storedAuth.tokens && !config.clientId) {
+        clearClientInfo(serverName, authStorageOptions)
+        clearCodeVerifier(serverName, authStorageOptions)
+        clearOAuthState(serverName, authStorageOptions)
+      }
+    }, signal)
 
     const authProvider = new McpOAuthProvider(serverName, serverUrl, config, {
       onRedirect: async () => {
@@ -502,7 +483,7 @@ export async function startAuth(
     } catch (error) {
       releaseCallbackServer(oauthState)
       try {
-        await cleanupAndReleaseCallbackServerIfIdle(() => clearOAuthState(serverName, authStorageOptions))
+        await cleanupAndReleaseCallbackServerIfIdle(() => withAuthEntryTransaction(serverName, async () => clearOAuthState(serverName, authStorageOptions)))
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "OAuth startup cleanup failed")
       }
@@ -518,25 +499,26 @@ export async function startAuth(
   }, authStorageOptions, runtime.signal, oauthState)
 
   try {
-    const storedAuth = await getAuthForUrl(serverName, serverUrl, authStorageOptions)
-    if (storedAuth?.clientInfo && !config.clientId) {
-      if (!storedAuth.tokens) {
-        clearClientInfo(serverName, authStorageOptions)
-        clearCodeVerifier(serverName, authStorageOptions)
-        await clearOAuthState(serverName, authStorageOptions)
-      } else {
-        const redirectUris = storedAuth.clientInfo.redirectUris
-        const redirectUriMatches = Array.isArray(redirectUris)
-          && redirectUris.includes(authProvider.redirectUrl ?? "")
-        if (!redirectUriMatches && !storedAuth.tokens.refreshToken) {
-          // A stale redirect URI only blocks the interactive leg; refresh does
-          // not send redirect_uri, so keep refresh-capable credentials intact.
+    await withAuthEntryTransaction(serverName, async () => {
+      const storedAuth = getAuthForUrl(serverName, serverUrl, authStorageOptions)
+      if (storedAuth?.clientInfo && !config.clientId) {
+        if (!storedAuth.tokens) {
           clearClientInfo(serverName, authStorageOptions)
           clearCodeVerifier(serverName, authStorageOptions)
-          await clearOAuthState(serverName, authStorageOptions)
+          clearOAuthState(serverName, authStorageOptions)
+        } else {
+          const redirectUris = storedAuth.clientInfo.redirectUris
+          const redirectUriMatches = Array.isArray(redirectUris)
+            && redirectUris.includes(authProvider.redirectUrl ?? "")
+          if (!redirectUriMatches && !storedAuth.tokens.refreshToken) {
+            // Refresh does not send redirect_uri; preserve refresh-capable credentials.
+            clearClientInfo(serverName, authStorageOptions)
+            clearCodeVerifier(serverName, authStorageOptions)
+            clearOAuthState(serverName, authStorageOptions)
+          }
         }
       }
-    }
+    }, signal)
 
     throwIfAborted(signal)
 
@@ -547,7 +529,7 @@ export async function startAuth(
     if (result === "AUTHORIZED") {
       authProvider.deactivate()
       releaseCallbackServer(oauthState)
-      await clearOAuthState(serverName, authStorageOptions)
+      await withAuthEntryTransaction(serverName, async () => clearOAuthState(serverName, authStorageOptions))
       await stopCallbackServerIfIdle()
       return { authorizationUrl: "" }
     }
@@ -633,10 +615,10 @@ async function clearPendingAuth(
   const stateToRelease = pendingState ?? oauthState
   if (stateToRelease) {
     cancelPendingCallback(stateToRelease)
-    const storedState = await getOAuthState(serverName, authStorageOptions)
-    if (storedState === stateToRelease) {
-      await clearOAuthState(serverName, authStorageOptions)
-    }
+    await withAuthEntryTransaction(serverName, async () => {
+      const storedState = getOAuthState(serverName, authStorageOptions)
+      if (storedState === stateToRelease) clearOAuthState(serverName, authStorageOptions)
+    })
   }
 }
 
@@ -1041,7 +1023,7 @@ export async function getValidToken(
   const authStorageOptions = options.authStorageOptions ?? {}
   const signal = combineAbortSignals(runtime.signal, options.signal)
   throwIfAborted(signal)
-  const entry = await getAuthForUrl(serverName, serverUrl, authStorageOptions)
+  const entry = await withAuthEntryTransaction(serverName, async () => getAuthForUrl(serverName, serverUrl, authStorageOptions), signal)
   throwIfAborted(signal)
   if (!entry?.tokens) {
     return null
@@ -1080,7 +1062,7 @@ export async function getValidToken(
         if (result !== "AUTHORIZED") {
           return null
         }
-        const refreshed = await getAuthForUrl(serverName, serverUrl, authStorageOptions)
+        const refreshed = getAuthForUrl(serverName, serverUrl, authStorageOptions, { migrateLegacy: false })
         throwIfAborted(signal)
         return refreshed?.tokens ?? null
       } finally {
@@ -1106,11 +1088,9 @@ export async function getValidToken(
 export async function getAuthStatus(serverName: string, options: AuthenticateOptions = {}): Promise<AuthStatus> {
   getRuntime(options)
   const authStorageOptions = options.authStorageOptions ?? {}
-  const hasTokens = await hasStoredTokens(serverName, authStorageOptions)
-  if (!hasTokens) return "not_authenticated"
-
-  const expired = await isTokenExpired(serverName, authStorageOptions)
-  return expired ? "expired" : "authenticated"
+  const entry = getAuthEntry(serverName, authStorageOptions, { migrateLegacy: false })
+  if (!entry?.tokens) return "not_authenticated"
+  return entry.tokens.expiresAt && entry.tokens.expiresAt < Date.now() / 1000 ? "expired" : "authenticated"
 }
 
 /**
@@ -1123,15 +1103,14 @@ export async function removeAuth(serverName: string, options: AuthenticateOption
   const signal = combineAbortSignals(runtime.signal, options.signal)
   throwIfAborted(signal)
   const authStorageOptions = options.authStorageOptions ?? {}
-  const oauthState = await getOAuthState(serverName, authStorageOptions)
+  const oauthState = getAuthEntry(serverName, authStorageOptions, { migrateLegacy: false })?.oauthState
   throwIfAborted(signal)
   if (oauthState) {
     cancelPendingCallback(oauthState)
   }
   await clearPendingAuthAndReleaseIfIdle(runtime, serverName, oauthState, authStorageOptions)
   throwIfAborted(signal)
-  clearAllCredentials(serverName, authStorageOptions)
-  await clearOAuthState(serverName, authStorageOptions)
+  await withAuthEntryTransaction(serverName, async () => clearAllCredentials(serverName, authStorageOptions), signal)
   throwIfAborted(signal)
   console.log(`MCP Auth: Removed credentials for ${serverName}`)
 }

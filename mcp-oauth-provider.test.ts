@@ -442,70 +442,114 @@ describe("McpOAuthProvider", () => {
       const stored = await provider.tokens()
       assert.strictEqual(stored, undefined)
     })
+  })
 
-    it("should serialize auth-scoped token reads and re-read rotated tokens after waiting", async () => {
-      const lockServerName = "refresh-lock-provider"
-      const first = new McpOAuthProvider(lockServerName, serverUrl, {}, {
-        onRedirect: async () => {},
+  describe("auth transactions", () => {
+    it("persists callback tokens with their issuing client across overlapping browser flows", async () => {
+      const name = `callback-binding-${randomBytes(6).toString("hex")}`
+      const first = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      const second = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      await first.withAuthTransaction(async () => {
+        await first.saveClientInformation({ client_id: "fake-client-a", redirect_uris: [first.redirectUrl!] })
+        return "REDIRECT"
       })
-      const second = new McpOAuthProvider(lockServerName, serverUrl, {}, {
-        onRedirect: async () => {},
+      await second.withAuthTransaction(async () => {
+        await second.saveClientInformation({ client_id: "fake-client-b", redirect_uris: [second.redirectUrl!] })
+        return "REDIRECT"
       })
-      saveAuthEntry(lockServerName, {
-        tokens: {
-          accessToken: "old-access",
-          refreshToken: "old-refresh",
-          expiresAt: Math.floor(Date.now() / 1000) - 60,
-        },
-        serverUrl,
-      }, serverUrl)
-
-      const firstTokens = await first.tokens({ issuer: "https://issuer.example" })
-      assert.strictEqual(firstTokens?.refresh_token, "old-refresh")
-      const secondTokensPromise = second.tokens({ issuer: "https://issuer.example" })
-      await new Promise(resolve => setTimeout(resolve, 100))
-
-      await first.saveTokens({
-        access_token: "new-access",
-        refresh_token: "new-refresh",
-        token_type: "Bearer",
-        expires_in: 3600,
+      await first.withAuthTransaction(async () => {
+        assert.strictEqual((await first.clientInformation())?.client_id, "fake-client-a")
+        await first.saveTokens({ access_token: "fake-a-access", refresh_token: "fake-a-refresh", token_type: "Bearer" })
+        return "AUTHORIZED"
       })
-
-      const secondTokens = await secondTokensPromise
-      assert.strictEqual(secondTokens?.access_token, "new-access")
-      assert.strictEqual(secondTokens?.refresh_token, "new-refresh")
+      const stored = getAuthForUrl(name, serverUrl)
+      assert.strictEqual(stored?.clientInfo?.clientId, "fake-client-a")
+      assert.strictEqual(stored?.tokens?.refreshToken, "fake-a-refresh")
+    })
+    it("keeps an existing stamped client bound to a pending browser flow", async () => {
+      const name = `stored-callback-${randomBytes(6).toString("hex")}`
+      saveAuthEntry(name, { clientInfo: { clientId: "fake-stored-a", issuer: "https://issuer.example", redirectUris: ["http://localhost:19876/callback"] }, serverUrl }, serverUrl)
+      const pending = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} }, {}, undefined, "fake-state")
+      await pending.withAuthTransaction(async () => {
+        assert.strictEqual((await pending.clientInformation())?.client_id, "fake-stored-a")
+        return "REDIRECT"
+      })
+      saveAuthEntry(name, { clientInfo: { clientId: "fake-new-b", issuer: "https://issuer.example", redirectUris: ["http://localhost:19876/callback"] }, serverUrl }, serverUrl)
+      await pending.withAuthTransaction(async () => {
+        assert.strictEqual((await pending.clientInformation())?.client_id, "fake-stored-a")
+        return "AUTHORIZED"
+      })
     })
 
-    it("should release the refresh lock when auth falls back without flow state", async () => {
-      const lockServerName = "refresh-lock-state-fallback"
-      const first = new McpOAuthProvider(lockServerName, serverUrl, {}, {
-        onRedirect: async () => {},
+    it("holds ownership across token saves, recovery, and callback failure", async () => {
+      const name = `transaction-${randomBytes(6).toString("hex")}`
+      const first = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      const second = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      let start!: () => void
+      let finish!: () => void
+      const begun = new Promise<void>(resolve => { start = resolve })
+      const gate = new Promise<void>(resolve => { finish = resolve })
+      const failure = new Error("callback failed")
+      const owning = first.withAuthTransaction(async () => {
+        await first.saveTokens({ access_token: "old", refresh_token: "old-refresh", token_type: "Bearer" })
+        await first.invalidateCredentials("tokens")
+        start()
+        await gate
+        throw failure
       })
-      const second = new McpOAuthProvider(lockServerName, serverUrl, {}, {
-        onRedirect: async () => {},
+      const rejected = assert.rejects(owning, error => error === failure)
+      await begun
+      let entered = false
+      const waiting = second.withAuthTransaction(async () => { entered = true; return "AUTHORIZED" })
+      try {
+        await new Promise(resolve => setTimeout(resolve, 150))
+        assert.strictEqual(entered, false)
+      } finally {
+        finish()
+        await rejected
+        assert.strictEqual(await waiting, "AUTHORIZED")
+      }
+    })
+
+    it("persists a minted refresh response before releasing a deactivated transaction", async () => {
+      const name = `transaction-cancel-${randomBytes(6).toString("hex")}`
+      const first = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      const second = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      let finish!: () => void
+      let start!: () => void
+      const gate = new Promise<void>(resolve => { finish = resolve })
+      const begun = new Promise<void>(resolve => { start = resolve })
+      const owning = first.withAuthTransaction(async () => {
+        start()
+        await gate
+        await first.saveTokens({ access_token: "minted", refresh_token: "rotated", token_type: "Bearer" })
+        return "AUTHORIZED"
       })
-      saveAuthEntry(lockServerName, {
-        tokens: {
-          accessToken: "old-access",
-          refreshToken: "old-refresh",
-          expiresAt: Math.floor(Date.now() / 1000) - 60,
-        },
-        serverUrl,
-      }, serverUrl)
+      await begun
+      first.deactivate()
+      let entered = false
+      const waiting = second.withAuthTransaction(async () => {
+        entered = true
+        assert.strictEqual((await second.tokens())?.refresh_token, "rotated")
+        return "AUTHORIZED"
+      })
+      try {
+        await new Promise(resolve => setTimeout(resolve, 150))
+        assert.strictEqual(entered, false)
+      } finally {
+        finish()
+        assert.strictEqual(await owning, "AUTHORIZED")
+        assert.strictEqual(await waiting, "AUTHORIZED")
+      }
+      await assert.rejects(first.saveTokens({ access_token: "late", token_type: "Bearer" }), /no longer active/)
+    })
 
-      assert.strictEqual((await first.tokens({ issuer: "https://issuer.example" }))?.refresh_token, "old-refresh")
-      await assert.rejects(
-        async () => first.state(),
-        (err: unknown) => err instanceof UnauthorizedError && /Re-authentication required/.test((err as Error).message),
-      )
-
-      const secondTokens = await Promise.race([
-        second.tokens({ issuer: "https://issuer.example" }),
-        new Promise<undefined>((_, reject) => setTimeout(() => reject(new Error("refresh lock was not released")), 1000)),
-      ])
-      assert.strictEqual(secondTokens?.refresh_token, "old-refresh")
-      second.deactivate()
+    it("releases ownership on missing-state fallback without retaining provider state", async () => {
+      const name = `transaction-state-${randomBytes(6).toString("hex")}`
+      const first = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      const second = new McpOAuthProvider(name, serverUrl, {}, { onRedirect: async () => {} })
+      await assert.rejects(first.withAuthTransaction(async () => { await first.state(); return "REDIRECT" }), UnauthorizedError)
+      assert.strictEqual(await second.withAuthTransaction(async () => "AUTHORIZED"), "AUTHORIZED")
     })
   })
 

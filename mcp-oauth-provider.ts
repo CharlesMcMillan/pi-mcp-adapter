@@ -8,6 +8,7 @@
 import {
   UnauthorizedError,
   type AddClientAuthentication,
+  type AuthResult,
   type OAuthClientInformationContext,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -21,10 +22,11 @@ import {
   getAuthForUrl,
   updateTokens,
   updateClientInfo,
+  saveAuthEntry,
   clearAllCredentials,
   clearCodeVerifier,
-  getAuthBaseDir,
   invalidateAuthEntryCache,
+  withAuthEntryTransaction,
   type AuthEntry,
   type AuthStorageOptions,
   type StoredTokens,
@@ -33,7 +35,10 @@ import {
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
 import { resolveCommandSecret } from "./utils.ts"
 import { getAppClientUri, getAppName } from "./agent-dir.ts"
-import { acquireRefreshLock, type RefreshLock } from "./mcp-refresh-lock.ts"
+import { randomUUID } from "node:crypto"
+import { AsyncLocalStorage } from "node:async_hooks"
+import { logOAuthDiagnostic } from "./oauth-diagnostics.ts"
+import { authFetch } from "./mcp-auth-fetch.ts"
 
 /**
  * Client name advertised during Dynamic Client Registration.
@@ -217,7 +222,7 @@ async function loadConfiguredDiscoveryState(
   skipIssuerValidation: boolean,
   signal?: AbortSignal,
 ): Promise<OAuthDiscoveryState> {
-  const response = await fetch(metadataUrl, {
+  const response = await authFetch(signal)(metadataUrl, {
     headers: { accept: "application/json" },
     ...(signal !== undefined ? { signal } : {}),
   })
@@ -251,6 +256,8 @@ async function loadConfiguredDiscoveryState(
 export class McpOAuthProvider implements OAuthClientProvider {
   private readonly redirectUrlSnapshot: string | undefined
   private active = true
+  private readonly authTransaction = new AsyncLocalStorage<{ active: boolean }>()
+  private readonly deactivation = new AbortController()
   private flowClientInfo: StoredClientInfo | undefined
   private flowCodeVerifier: string | undefined
   private flowDiscoveryState: OAuthDiscoveryState | undefined
@@ -262,7 +269,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private lastObservedClientId: string | undefined
   private lastSavedAccessToken: string | undefined
   private pendingAuthAccessToken: string | undefined
-  private refreshLock: RefreshLock | undefined
 
   constructor(
     private serverName: string,
@@ -279,6 +285,32 @@ export class McpOAuthProvider implements OAuthClientProvider {
       : config.redirectUri ?? `http://localhost:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
   }
 
+  async withAuthTransaction(operation: () => Promise<AuthResult>): Promise<AuthResult> {
+    this.throwIfInactive()
+    const details = { serverName: this.serverName, transactionId: randomUUID() }
+    const started = performance.now()
+    void logOAuthDiagnostic("oauth_transaction_waiting", details)
+    try {
+      const result = await withAuthEntryTransaction(this.serverName, async () => {
+        this.throwIfInactive()
+        void logOAuthDiagnostic("oauth_transaction_acquired", { ...details, durationMs: performance.now() - started })
+        const transaction = { active: true }
+        return this.authTransaction.run(transaction, async () => {
+          try {
+            return await operation()
+          } finally {
+            transaction.active = false
+          }
+        })
+      }, this.runtimeSignal ? AbortSignal.any([this.runtimeSignal, this.deactivation.signal]) : this.deactivation.signal)
+      void logOAuthDiagnostic("oauth_transaction_completed", { ...details, result, durationMs: performance.now() - started })
+      return result
+    } catch (error) {
+      void logOAuthDiagnostic("oauth_transaction_failed", { ...details, durationMs: performance.now() - started })
+      throw error
+    }
+  }
+
   private get usesClientCredentials(): boolean {
     return this.config.grantType === "client_credentials"
   }
@@ -290,34 +322,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   deactivate(): void {
     this.active = false
-    this.releaseRefreshLock()
+    this.deactivation.abort(new Error("OAuth flow is no longer active"))
     this.invalidatedAccessToken = undefined
     this.invalidatedClientId = undefined
     this.staleRedirectClientId = undefined
     this.lastObservedClientId = undefined
     this.lastSavedAccessToken = undefined
     this.pendingAuthAccessToken = undefined
-  }
-
-  private async acquireRefreshLockForAuth(
-    ctx: OAuthClientInformationContext | undefined,
-    entry: AuthEntry | undefined,
-  ): Promise<AuthEntry | undefined> {
-    if (ctx === undefined || this.refreshLock !== undefined || !entry?.tokens?.refreshToken) return entry
-    this.refreshLock = await acquireRefreshLock(this.serverName, getAuthBaseDir(this.storageOptions))
-
-    // Another process may have completed the refresh while this one waited.
-    // Re-read shared storage after acquiring the lock so the next refresh uses
-    // the newest rotating refresh token rather than the stale pre-lock copy.
-    invalidateAuthEntryCache(this.serverName)
-    return (await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)) ?? entry
-  }
-
-  private releaseRefreshLock(): void {
-    const lock = this.refreshLock
-    if (!lock) return
-    this.refreshLock = undefined
-    lock.release()
   }
 
   private assertStoredIssuerBindings(entry: AuthEntry | undefined, issuer: string | undefined): void {
@@ -393,12 +404,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
    * Get client information (for pre-registered or dynamically registered clients).
    * Returns undefined if no client info exists or if the server URL has changed.
    */
-  async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+  async clientInformation(ctx?: OAuthClientInformationContext): Promise<OAuthClientInformationMixed | undefined> {
     if (this.invalidatedClientId !== undefined) {
       invalidateAuthEntryCache(this.serverName)
     }
     const issuer = this.discoveredIssuer
-    const stored = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
+    const stored = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions, { migrateLegacy: ctx !== undefined, cache: true })
     this.assertStoredIssuerBindings(stored, issuer)
 
     // Check config first (pre-registered client). Store only its issuer binding.
@@ -407,7 +418,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       const storedClient = stored?.clientInfo?.clientId === this.config.clientId
         ? stored.clientInfo
         : undefined
-      if (issuer && (storedClient?.issuer !== issuer || storedClient.configPreRegistered !== true)) {
+      if (ctx !== undefined && issuer && (storedClient?.issuer !== issuer || storedClient.configPreRegistered !== true)) {
         updateClientInfo(
           this.serverName,
           { clientId: this.config.clientId, issuer, configPreRegistered: true },
@@ -459,8 +470,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
       }
       if (issuer && clientInfo.issuer === undefined) {
         clientInfo.issuer = issuer
-        this.flowClientInfo = clientInfo
-        updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
+        if (ctx !== undefined) {
+          this.flowClientInfo = clientInfo
+          updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
+        }
       }
       // Keep a stale dynamic registration available for its refresh attempt,
       // but suppress it if that attempt invalidates the token and auth falls
@@ -472,6 +485,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
       // Return all registration metadata and the local issuer extension.
       // This keeps the SDK OAuth view and the stored issuer binding consistent.
       this.lastObservedClientId = clientInfo.clientId
+      if (this.flowState) this.flowClientInfo = clientInfo
       return {
         client_id: clientInfo.clientId,
         client_secret: clientInfo.clientSecret,
@@ -540,15 +554,14 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
 
     // Use getAuthForUrl to validate tokens are for the current server URL.
-    let entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
-    entry = await this.acquireRefreshLockForAuth(ctx, entry)
+    const entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions, { migrateLegacy: ctx !== undefined, cache: true })
     if (!entry?.tokens || entry.tokens.accessToken === this.invalidatedAccessToken) return undefined
     this.invalidatedAccessToken = undefined
     const issuer = this.discoveredIssuer
     this.assertStoredIssuerBindings(entry, issuer)
     if (issuer && entry.tokens.issuer === undefined) {
       entry.tokens.issuer = issuer
-      updateTokens(this.serverName, entry.tokens, this.serverUrl, this.storageOptions)
+      if (ctx !== undefined) updateTokens(this.serverName, entry.tokens, this.serverUrl, this.storageOptions)
     }
     if (ctx !== undefined) {
       this.pendingAuthAccessToken = entry.tokens.accessToken
@@ -572,14 +585,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
       ...(tokens.scope !== undefined ? { scope: tokens.scope } : {}),
       ...(issuer !== undefined ? { issuer } : {}),
     }
-    this.throwIfInactive()
-    try {
-      updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
-    } catch (error) {
-      this.releaseRefreshLock()
-      throw error
-    }
-    this.releaseRefreshLock()
+    // A refresh may have rotated remotely before cancellation was observed.
+    // Persist its response while the transaction still owns the credential lock.
+    if (!this.authTransaction.getStore()?.active) this.throwIfInactive()
+    const entry = getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions) ?? {}
+    saveAuthEntry(this.serverName, {
+      ...entry,
+      tokens: storedTokens,
+      ...(this.flowClientInfo ? { clientInfo: this.flowClientInfo } : {}),
+    }, this.serverUrl, this.storageOptions)
     this.invalidatedAccessToken = undefined
     this.lastSavedAccessToken = storedTokens.accessToken
     // Discovery must survive the browser redirect so the callback can verify
@@ -604,7 +618,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     // No flow-local state means we're on the post-refresh authorize fallback.
     this.throwIfInactive()
-    this.releaseRefreshLock()
     if (!this.flowState) {
       throw new UnauthorizedError(
         `Re-authentication required for MCP server: ${this.serverName}`,
@@ -653,7 +666,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.config.authServerMetadataUrl,
         this.serverUrl,
         this.config.skipIssuerMetadataValidation === true,
-        this.runtimeSignal,
+        this.runtimeSignal ? AbortSignal.any([this.runtimeSignal, this.deactivation.signal]) : this.deactivation.signal,
       )
     }
     return this.flowDiscoveryState ? structuredClone(this.flowDiscoveryState) : undefined
@@ -677,11 +690,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     this.throwIfInactive()
     if (!this.flowState) {
-      // Transport-driven refreshes have no interactive flow state. The SDK
-      // calls state() while falling back to authorization; release the lock
-      // before surfacing re-authentication, otherwise a waiting user flow can
-      // hold the cross-process refresh lock indefinitely.
-      this.releaseRefreshLock()
       throw new UnauthorizedError(
         `Re-authentication required for MCP server: ${this.serverName}`,
       )
@@ -697,7 +705,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.throwIfInactive()
     switch (type) {
       case "all":
-        this.releaseRefreshLock()
         this.flowClientInfo = undefined
         this.flowCodeVerifier = undefined
         this.flowDiscoveryState = undefined
@@ -721,7 +728,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
         invalidateAuthEntryCache(this.serverName)
         break
       case "tokens":
-        this.releaseRefreshLock()
         // Invalidation is provider-local. Persistently deleting a shared token
         // here lets a process refreshing stale cached credentials erase a token
         // that another process just authorized. A later tokens() call bypasses

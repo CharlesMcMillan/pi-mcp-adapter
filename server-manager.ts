@@ -39,7 +39,7 @@ import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 import { logger } from "./logger.ts";
 import { RESOURCE_MIME_TYPE } from "./ui-app-bridge-helpers.ts";
 import { McpOAuthProvider } from "./mcp-oauth-provider.ts";
-import { extractOAuthConfig, supportsOAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
+import { createOAuthAwareFetch, extractOAuthConfig, supportsOAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { inspectAuthForUrl, invalidateAuthEntryCache, type AuthStorageOptions } from "./mcp-auth.ts";
 import { getBearerTokenForUrl } from "./mcp-bearer-store.ts";
 import { registerSamplingHandler, type ServerSamplingConfig } from "./sampling-handler.ts";
@@ -1261,8 +1261,9 @@ export class McpServerManager {
       const authProvider = "provider" in authState ? authState.provider : undefined;
       const transportOptions = {
         ...(requestInit !== undefined ? { requestInit } : {}),
-        ...(requestFetch !== undefined ? { fetch: requestFetch } : {}),
-        ...(authProvider !== undefined ? { authProvider } : {}),
+        ...(authProvider !== undefined
+          ? { fetch: createOAuthAwareFetch(requestFetch), authProvider }
+          : requestFetch !== undefined ? { fetch: requestFetch } : {}),
         ...(authProvider !== undefined
           && definition.oauth !== false
           && definition.oauth?.skipIssuerMetadataValidation === true
