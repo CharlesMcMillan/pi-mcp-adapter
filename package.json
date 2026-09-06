@@ -139,6 +139,7 @@
     "mcp-bearer-store.ts",
     "mcp-keyring-helper.cjs",
     "mcp-oauth-provider.ts",
+    "mcp-refresh-lock.ts",
     "mcp-callback-server.ts",
     "mcp-auth-flow.ts",
     "mcp-panel.ts",

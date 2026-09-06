@@ -23,6 +23,7 @@ import {
   updateClientInfo,
   clearAllCredentials,
   clearCodeVerifier,
+  getAuthBaseDir,
   invalidateAuthEntryCache,
   type AuthEntry,
   type AuthStorageOptions,
@@ -32,6 +33,7 @@ import {
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
 import { resolveCommandSecret } from "./utils.ts"
 import { getAppClientUri, getAppName } from "./agent-dir.ts"
+import { acquireRefreshLock, type RefreshLock } from "./mcp-refresh-lock.ts"
 
 /**
  * Client name advertised during Dynamic Client Registration.
@@ -260,6 +262,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private lastObservedClientId: string | undefined
   private lastSavedAccessToken: string | undefined
   private pendingAuthAccessToken: string | undefined
+  private refreshLock: RefreshLock | undefined
 
   constructor(
     private serverName: string,
@@ -287,12 +290,34 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   deactivate(): void {
     this.active = false
+    this.releaseRefreshLock()
     this.invalidatedAccessToken = undefined
     this.invalidatedClientId = undefined
     this.staleRedirectClientId = undefined
     this.lastObservedClientId = undefined
     this.lastSavedAccessToken = undefined
     this.pendingAuthAccessToken = undefined
+  }
+
+  private async acquireRefreshLockForAuth(
+    ctx: OAuthClientInformationContext | undefined,
+    entry: AuthEntry | undefined,
+  ): Promise<AuthEntry | undefined> {
+    if (ctx === undefined || this.refreshLock !== undefined || !entry?.tokens?.refreshToken) return entry
+    this.refreshLock = await acquireRefreshLock(this.serverName, getAuthBaseDir(this.storageOptions))
+
+    // Another process may have completed the refresh while this one waited.
+    // Re-read shared storage after acquiring the lock so the next refresh uses
+    // the newest rotating refresh token rather than the stale pre-lock copy.
+    invalidateAuthEntryCache(this.serverName)
+    return (await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)) ?? entry
+  }
+
+  private releaseRefreshLock(): void {
+    const lock = this.refreshLock
+    if (!lock) return
+    this.refreshLock = undefined
+    lock.release()
   }
 
   private assertStoredIssuerBindings(entry: AuthEntry | undefined, issuer: string | undefined): void {
@@ -515,7 +540,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
 
     // Use getAuthForUrl to validate tokens are for the current server URL.
-    const entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
+    let entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
+    entry = await this.acquireRefreshLockForAuth(ctx, entry)
     if (!entry?.tokens || entry.tokens.accessToken === this.invalidatedAccessToken) return undefined
     this.invalidatedAccessToken = undefined
     const issuer = this.discoveredIssuer
@@ -547,7 +573,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
       ...(issuer !== undefined ? { issuer } : {}),
     }
     this.throwIfInactive()
-    updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
+    try {
+      updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
+    } catch (error) {
+      this.releaseRefreshLock()
+      throw error
+    }
+    this.releaseRefreshLock()
     this.invalidatedAccessToken = undefined
     this.lastSavedAccessToken = storedTokens.accessToken
     // Discovery must survive the browser redirect so the callback can verify
@@ -572,6 +604,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     // No flow-local state means we're on the post-refresh authorize fallback.
     this.throwIfInactive()
+    this.releaseRefreshLock()
     if (!this.flowState) {
       throw new UnauthorizedError(
         `Re-authentication required for MCP server: ${this.serverName}`,
@@ -644,6 +677,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     this.throwIfInactive()
     if (!this.flowState) {
+      // Transport-driven refreshes have no interactive flow state. The SDK
+      // calls state() while falling back to authorization; release the lock
+      // before surfacing re-authentication, otherwise a waiting user flow can
+      // hold the cross-process refresh lock indefinitely.
+      this.releaseRefreshLock()
       throw new UnauthorizedError(
         `Re-authentication required for MCP server: ${this.serverName}`,
       )
@@ -659,6 +697,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.throwIfInactive()
     switch (type) {
       case "all":
+        this.releaseRefreshLock()
         this.flowClientInfo = undefined
         this.flowCodeVerifier = undefined
         this.flowDiscoveryState = undefined
@@ -682,6 +721,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         invalidateAuthEntryCache(this.serverName)
         break
       case "tokens":
+        this.releaseRefreshLock()
         // Invalidation is provider-local. Persistently deleting a shared token
         // here lets a process refreshing stale cached credentials erase a token
         // that another process just authorized. A later tokens() call bypasses

@@ -442,6 +442,71 @@ describe("McpOAuthProvider", () => {
       const stored = await provider.tokens()
       assert.strictEqual(stored, undefined)
     })
+
+    it("should serialize auth-scoped token reads and re-read rotated tokens after waiting", async () => {
+      const lockServerName = "refresh-lock-provider"
+      const first = new McpOAuthProvider(lockServerName, serverUrl, {}, {
+        onRedirect: async () => {},
+      })
+      const second = new McpOAuthProvider(lockServerName, serverUrl, {}, {
+        onRedirect: async () => {},
+      })
+      saveAuthEntry(lockServerName, {
+        tokens: {
+          accessToken: "old-access",
+          refreshToken: "old-refresh",
+          expiresAt: Math.floor(Date.now() / 1000) - 60,
+        },
+        serverUrl,
+      }, serverUrl)
+
+      const firstTokens = await first.tokens({ issuer: "https://issuer.example" })
+      assert.strictEqual(firstTokens?.refresh_token, "old-refresh")
+      const secondTokensPromise = second.tokens({ issuer: "https://issuer.example" })
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      await first.saveTokens({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        token_type: "Bearer",
+        expires_in: 3600,
+      })
+
+      const secondTokens = await secondTokensPromise
+      assert.strictEqual(secondTokens?.access_token, "new-access")
+      assert.strictEqual(secondTokens?.refresh_token, "new-refresh")
+    })
+
+    it("should release the refresh lock when auth falls back without flow state", async () => {
+      const lockServerName = "refresh-lock-state-fallback"
+      const first = new McpOAuthProvider(lockServerName, serverUrl, {}, {
+        onRedirect: async () => {},
+      })
+      const second = new McpOAuthProvider(lockServerName, serverUrl, {}, {
+        onRedirect: async () => {},
+      })
+      saveAuthEntry(lockServerName, {
+        tokens: {
+          accessToken: "old-access",
+          refreshToken: "old-refresh",
+          expiresAt: Math.floor(Date.now() / 1000) - 60,
+        },
+        serverUrl,
+      }, serverUrl)
+
+      assert.strictEqual((await first.tokens({ issuer: "https://issuer.example" }))?.refresh_token, "old-refresh")
+      await assert.rejects(
+        async () => first.state(),
+        (err: unknown) => err instanceof UnauthorizedError && /Re-authentication required/.test((err as Error).message),
+      )
+
+      const secondTokens = await Promise.race([
+        second.tokens({ issuer: "https://issuer.example" }),
+        new Promise<undefined>((_, reject) => setTimeout(() => reject(new Error("refresh lock was not released")), 1000)),
+      ])
+      assert.strictEqual(secondTokens?.refresh_token, "old-refresh")
+      second.deactivate()
+    })
   })
 
   describe("redirectToAuthorization", () => {
