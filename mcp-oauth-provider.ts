@@ -34,13 +34,12 @@ import {
   type StoredClientInfo,
 } from "./mcp-auth.ts"
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
-import { createOAuthFetch, type OAuthFetch } from "./mcp-auth-fetch.ts"
+import { authFetch, createOAuthFetch, type OAuthFetch } from "./mcp-auth-fetch.ts"
 import { resolveCommandSecret } from "./utils.ts"
 import { getAppClientUri, getAppName } from "./agent-dir.ts"
 import { randomUUID } from "node:crypto"
 import { AsyncLocalStorage } from "node:async_hooks"
 import { logOAuthDiagnostic } from "./oauth-diagnostics.ts"
-import { authFetch } from "./mcp-auth-fetch.ts"
 import { combineAbortSignals } from "./runtime-owner.ts"
 
 /**

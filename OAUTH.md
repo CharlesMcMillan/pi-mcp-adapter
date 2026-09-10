@@ -242,7 +242,7 @@ This development branch pins SDK client/core previews to one immutable commit be
 
 Set `PI_MCP_OAUTH_LOG` to an absolute JSONL file path before launching Pi. Records include PID, transaction ID, server name, wait/total duration, and terminal result. They exclude token values, client secrets, authorization codes, endpoint URLs, and raw error messages. Logging failure never changes authentication behavior.
 
-Events are `oauth_transaction_waiting`, `oauth_transaction_acquired`, `oauth_transaction_completed`, and `oauth_transaction_failed`. A completed telemetry write or CI check is not proof that authentication succeeded; inspect the terminal result.
+Events are `oauth_transaction_waiting`, `oauth_transaction_acquired`, `oauth_transaction_completed`, and `oauth_transaction_failed`. Check the completed event's `result` for `AUTHORIZED` or `REDIRECT`.
 
 ## Token Storage
 
