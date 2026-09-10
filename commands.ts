@@ -376,8 +376,6 @@ export async function logoutServer(
   }
 
   state.owner?.throwIfInactive();
-
-  state.owner?.throwIfInactive();
   updateStatusBar(state);
 
   const message = `OAuth credentials cleared for "${serverName}". Run /mcp-auth ${serverName} to authenticate again.`;
