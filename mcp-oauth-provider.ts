@@ -7,6 +7,7 @@
 
 import {
   UnauthorizedError,
+  type FetchLike,
   type AddClientAuthentication,
   type AuthResult,
   type OAuthClientInformationContext,
@@ -33,12 +34,14 @@ import {
   type StoredClientInfo,
 } from "./mcp-auth.ts"
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
+import { createOAuthFetch, type OAuthFetch } from "./mcp-auth-fetch.ts"
 import { resolveCommandSecret } from "./utils.ts"
 import { getAppClientUri, getAppName } from "./agent-dir.ts"
 import { randomUUID } from "node:crypto"
 import { AsyncLocalStorage } from "node:async_hooks"
 import { logOAuthDiagnostic } from "./oauth-diagnostics.ts"
 import { authFetch } from "./mcp-auth-fetch.ts"
+import { combineAbortSignals } from "./runtime-owner.ts"
 
 /**
  * Client name advertised during Dynamic Client Registration.
@@ -220,11 +223,10 @@ async function loadConfiguredDiscoveryState(
   metadataUrl: string,
   serverUrl: string,
   skipIssuerValidation: boolean,
-  signal?: AbortSignal,
+  fetchFn: FetchLike,
 ): Promise<OAuthDiscoveryState> {
-  const response = await authFetch(signal)(metadataUrl, {
+  const response = await fetchFn(metadataUrl, {
     headers: { accept: "application/json" },
-    ...(signal !== undefined ? { signal } : {}),
   })
   if (!response.ok) {
     await response.text().catch(() => {})
@@ -255,6 +257,7 @@ async function loadConfiguredDiscoveryState(
  */
 export class McpOAuthProvider implements OAuthClientProvider {
   private readonly redirectUrlSnapshot: string | undefined
+  private authFetch: OAuthFetch
   private active = true
   private readonly authTransaction = new AsyncLocalStorage<{ active: boolean }>()
   private readonly deactivation = new AbortController()
@@ -279,6 +282,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private runtimeSignal?: AbortSignal,
     initialState?: string,
   ) {
+    this.authFetch = createOAuthFetch(serverUrl, undefined, runtimeSignal)
     this.flowState = initialState
     this.redirectUrlSnapshot = config.grantType === "client_credentials"
       ? undefined
@@ -302,13 +306,17 @@ export class McpOAuthProvider implements OAuthClientProvider {
             transaction.active = false
           }
         })
-      }, this.runtimeSignal ? AbortSignal.any([this.runtimeSignal, this.deactivation.signal]) : this.deactivation.signal)
+      }, combineAbortSignals(this.runtimeSignal, this.deactivation.signal))
       void logOAuthDiagnostic("oauth_transaction_completed", { ...details, result, durationMs: performance.now() - started })
       return result
     } catch (error) {
       void logOAuthDiagnostic("oauth_transaction_failed", { ...details, durationMs: performance.now() - started })
       throw error
     }
+  }
+
+  setAuthFetch(fetchFn: OAuthFetch): void {
+    this.authFetch = fetchFn
   }
 
   private get usesClientCredentials(): boolean {
@@ -352,6 +360,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private throwIfInactive(): void {
     if (!this.active) throw new Error("OAuth flow is no longer active")
     this.runtimeSignal?.throwIfAborted()
+    // The SDK can swallow refresh fetch errors and attempt browser authorization.
+    // A failed service credential must stop that fallback and token persistence.
+    this.authFetch.throwIfHeaderResolutionFailed()
   }
 
   /**
@@ -666,7 +677,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.config.authServerMetadataUrl,
         this.serverUrl,
         this.config.skipIssuerMetadataValidation === true,
-        this.runtimeSignal ? AbortSignal.any([this.runtimeSignal, this.deactivation.signal]) : this.deactivation.signal,
+        authFetch(combineAbortSignals(this.runtimeSignal, this.deactivation.signal), this.authFetch),
       )
     }
     return this.flowDiscoveryState ? structuredClone(this.flowDiscoveryState) : undefined

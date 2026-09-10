@@ -433,6 +433,8 @@ export interface ServerEntry {
   cwd?: string;
   // HTTP fields
   url?: string;
+  /** PEM CA bundle replacing default roots for this HTTPS MCP origin only. */
+  caFile?: string;
   headers?: Record<string, string>;
   /** Add or replace HTTP headers by running a trusted command for each request. */
   requestHeadersCommand?: HttpRequestHeadersCommand;
@@ -460,7 +462,7 @@ export interface ServerEntry {
   // Resource handling
   exposeResources?: boolean;
   // Direct tool registration
-  directTools?: boolean | string[];
+  directTools?: boolean | string[] | "search";
   // Override settings.toolPrefix for this server.
   toolPrefix?: ToolPrefix;
   // Include/exclude specific MCP tools/resources by original or prefixed name
@@ -570,7 +572,7 @@ export interface McpSettings {
   agentPluginPaths?: string[];
   idleTimeout?: number; // minutes, default 10, 0 to disable
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
-  directTools?: boolean;
+  directTools?: boolean | "search";
   /**
    * Validate direct-tool inputs against the advertised schema after recovering
    * one JSON string layer for object and array properties. Defaults to false.
@@ -678,6 +680,8 @@ export interface PromptMetadata {
 }
 
 export interface DirectToolSpec {
+  /** Registered inactive; `mcp({ search })` activates it (directTools: "search"). */
+  lazy?: boolean;
   serverName: string;
   originalName: string;
   prefixedName: string;

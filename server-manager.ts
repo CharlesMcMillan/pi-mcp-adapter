@@ -66,7 +66,9 @@ import {
   traceTransportKind,
   wrapTransportWithMcpTrace,
 } from "./mcp-trace.ts";
+import { createOAuthFetch, resolveOAuthHeaders } from "./mcp-auth-fetch.ts";
 import { createRequestHeadersCommandFetch } from "./request-headers-command.ts";
+import { createCaFetch, validateCaFile } from "./http-ca.ts";
 
 const MAX_CAPTURED_STDERR_BYTES = 8 * 1024;
 const MAX_CAPTURED_STDERR_LINES = 3;
@@ -305,6 +307,7 @@ export class McpServerManager {
   }
 
   async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
+    validateCaFile(definition);
     if (isServerDisabled(definition)) throw new Error(`MCP server "${name}" is disabled`);
     if (this.stopped) throw new Error("MCP server manager is closed");
     const ownedSignal = combineAbortSignals(this.runtimeSignal, signal);
@@ -1193,10 +1196,13 @@ export class McpServerManager {
     // mutating the persisted configuration.
     const hasCommandHeader = Object.values(definition.headers ?? {})
       .some(value => value.startsWith("!") && !value.startsWith("!!"));
-    const headers = resolveCommandSecretsRecord(
-      definition.headers,
-      key => `MCP server "${serverName}" HTTP header "${key}"`,
-    ) ?? {};
+    const oauthEnabled = supportsOAuth(definition);
+    const headers = oauthEnabled
+      ? Object.fromEntries(resolveOAuthHeaders(definition.headers))
+      : resolveCommandSecretsRecord(
+        definition.headers,
+        key => `MCP server "${serverName}" HTTP header "${key}"`,
+      ) ?? {};
 
     // Resolve bearer auth before creating requestInit so every attempted
     // transport receives the same headers.
@@ -1221,18 +1227,27 @@ export class McpServerManager {
       }
     }
 
-    const requestInit = Object.keys(headers).length > 0 ? { headers } : undefined;
-    const requestFetch = definition.requestHeadersCommand
-      ? createRequestHeadersCommandFetch(definition.requestHeadersCommand)
-      : undefined;
-    const createAuthProvider = (): McpOAuthProvider => new McpOAuthProvider(
-      serverName,
-      serverUrl,
-      extractOAuthConfig(definition),
-      { onRedirect: async () => {} },
-      this.authStorageOptions,
-      this.oauthRuntime?.signal,
-    );
+    // Do not give origin-bound headers to SDK requestInit: it reuses those
+    // defaults for discovered OAuth endpoints, including other origins.
+    const requestInit = !oauthEnabled && Object.keys(headers).length > 0 ? { headers } : undefined;
+    const serviceHeaders = oauthEnabled ? new Headers(headers) : new Headers();
+    let caFetch = createCaFetch(definition);
+    try {
+    const createAuthProvider = (): McpOAuthProvider => {
+      const provider = new McpOAuthProvider(
+        serverName,
+        serverUrl,
+        extractOAuthConfig(definition),
+        { onRedirect: async () => {} },
+        this.authStorageOptions,
+        this.oauthRuntime?.signal,
+      );
+      provider.setAuthFetch(createOAuthFetch(serverUrl, () => serviceHeaders,
+        combineAbortSignals(this.oauthRuntime?.signal, signal), {
+          ...(caFetch ? { delegate: caFetch.fetch } : {}),
+        }));
+      return provider;
+    };
 
     // Explicit OAuth checks secure storage immediately. Implicit OAuth keeps
     // anonymous servers provider-free unless URL-bound credentials are already
@@ -1257,6 +1272,16 @@ export class McpServerManager {
         : { status: "explicit", provider: createAuthProvider() }
       : { status: "disabled" };
 
+    const commandFetch = definition.requestHeadersCommand
+      ? createRequestHeadersCommandFetch(definition.requestHeadersCommand, caFetch?.fetch)
+      : caFetch?.fetch;
+    const requestFetch = oauthEnabled
+      ? createOAuthFetch(serverUrl, () => serviceHeaders, this.oauthRuntime?.signal, {
+        // MCP streams outlive individual auth requests; retain SDK request deadlines.
+        timeout: false,
+        ...(commandFetch ? { delegate: commandFetch } : {}),
+      })
+      : commandFetch;
     const attempt = async (
       kind: "streamable-http" | "sse",
     ): Promise<
@@ -1307,7 +1332,24 @@ export class McpServerManager {
     let invalidated = credentialsInvalidated;
     for (;;) {
       const result = await attempt(kind);
-      if (result.status === "connected") return { ...result, credentialsInvalidated: invalidated };
+      if (result.status === "connected") {
+        const ownedCa = caFetch;
+        if (ownedCa) {
+          const close = result.transport.close.bind(result.transport);
+          const onclose = result.transport.onclose;
+          result.transport.onclose = () => {
+            void ownedCa.close().catch(error => {
+              logger.debug(`MCP: CA dispatcher cleanup failed for ${serverName}: ${String(error)}`);
+            });
+            onclose?.();
+          };
+          result.transport.close = async () => {
+            try { await close(); } finally { await ownedCa.close(); }
+          };
+          caFetch = undefined;
+        }
+        return { ...result, credentialsInvalidated: invalidated };
+      }
       if (result.error instanceof AggregateError
         && result.error.message === "MCP connection abort cleanup failed") {
         throw result.error;
@@ -1339,6 +1381,9 @@ export class McpServerManager {
         continue;
       }
       throw result.error;
+    }
+    } finally {
+      await caFetch?.close();
     }
   }
 

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- HTTPS MCP servers can configure an origin-scoped `caFile` PEM trust bundle without disabling certificate verification, for Streamable HTTP and SSE. Thanks to [@desmonna](https://github.com/desmonna) for #527.
+- `directTools: "search"` registers a server's tools as real direct tools but inactive; `mcp({ search })` activates the matches additively, reported as `addedToolNames`. Activation is per process and search is its only trigger. Search-mode tools do not count toward the 75-tool advisory. Thanks to [@chiptoe-svg](https://github.com/chiptoe-svg) for PR #525.
 - Script `tools.describe()` now exposes server-advertised output schemas for `data.structuredContent`, preserved through metadata caching and refresh. (#522)
 - Stdio MCP servers can opt out of arbitrary adapter environment inheritance with `inheritEnv: false`; SDK platform defaults and explicit `env` overlays remain. Thanks to [@zenolam](https://github.com/zenolam) for #509.
 - Local Claude plugin bundles can now be loaded from trusted configured directories, including bundled MCP servers and skills. Thanks to [@gugu91](https://github.com/gugu91) for PR #493.
@@ -15,12 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runtime MCP status snapshots now include each server's `directToolCount`, the number of direct tools currently registered with Pi, including resource tools. Thanks to [@FischLu](https://github.com/FischLu) for #482.
 
 ### Changed
+- Approval brokers now observe and can gate cached MCP calls; session grants apply only on abstention or no claim. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #534.
 - MCP setup and server panels now use Pi's active theme and TUI components while preserving their existing workflows. (#488)
 - MCP sampling requests now route through Pi's `ModelRegistry.complete`, leaving provider authentication, environment, and base URL handling to the host.
 - `mcp({ connect })` now reports the direct tools it discovers on the tool result via `addedToolNames`, Pi's result-scoped tool activation surface, so they load from that transcript point instead of through an active-tool list rewrite. (#490) Thanks to [@chiptoe-svg](https://github.com/chiptoe-svg) for PR #494.
 
 ### Fixed
 - OAuth credential transactions now serialize across processes using kernel locks, release on failure and cancellation, and keep callback tokens bound to their issuing client. Optional `PI_MCP_OAUTH_LOG` diagnostics identify processes and transactions without logging credentials.
+- MCP runtime cancellation now works on Node 20.0.0 when `AbortSignal.any` is unavailable. (#537)
+- OAuth now forwards configured service headers to same-origin discovery, registration, token exchange, and refresh requests, enabling authentication behind service-token gateways without leaking credentials to other origins. Thanks to [@ethanbrown3](https://github.com/ethanbrown3) for PR #533 and [@Davasny](https://github.com/Davasny) for reporting #530.
 - Script calls now preserve full intermediate data for filtering within a fixed 16 MiB cumulative transfer budget, returning `intermediate_result_too_large` when exhausted while retaining final-output guards. (#520)
 - Namespace proxy argument guidance now uses exact search-result tool names for schema inspection. Thanks to [@r1ckyIn](https://github.com/r1ckyIn) for PR #519.
 - Script `tools.describe()` now retains documented input field guidance alongside compact parameter shapes, including formats and units. (#521)

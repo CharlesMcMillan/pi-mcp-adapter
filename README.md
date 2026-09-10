@@ -250,7 +250,7 @@ const tokens = await getMcpOAuthTokensForUrl("jira", "https://jira.example.com/m
 updateMcpOAuthTokensForUrl("jira", "https://jira.example.com/mcp", { accessToken: "..." });
 ```
 
-The public subpath exposes only token read/update helpers plus a status helper. The async read path uses the adapter's refresh logic before it returns tokens. The helpers keep secure-store storage, URL binding, refresh persistence, chunk handling, legacy import, and fail-closed credential-store errors. They do not expose client registration secrets, PKCE verifiers, or OAuth state.
+The public subpath exposes only token read/update helpers plus a status helper. The async read path uses the adapter's refresh logic before it returns tokens. For a service-protected endpoint or a pre-registered OAuth client, pass the explicit refresh configuration as `getMcpOAuthTokensForUrl(name, url, { definition: { headers, oauth } })`. This optional configuration is never loaded from ambient config or stored with the tokens; headers are bound to the supplied MCP URL's origin. The helpers keep secure-store storage, URL binding, refresh persistence, chunk handling, legacy import, and fail-closed credential-store errors. They do not expose client registration secrets, PKCE verifiers, or OAuth state.
 
 ### Runtime status snapshots
 
@@ -297,6 +297,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `url` | HTTP endpoint (StreamableHTTP with SSE fallback); supports raw `${VAR}` and `$env:VAR` interpolation, and missing URL variables fail before any request is sent |
 | `headers` | HTTP headers; supports `${VAR}` and `$env:VAR` interpolation. A value beginning with `!` runs a command when the HTTP server connects or OAuth authenticates; use `!!` for a literal leading `!`. |
 | `requestHeadersCommand` | Trusted executable run for every HTTP request. It receives a versioned JSON envelope containing `method`, `url`, and the exact `bodyBase64` on stdin, and must return a JSON object of headers on stdout. `command`, `args`, and `env` support environment interpolation. Use for caller-bound request signatures; failures stop the request. |
+| `caFile` | HTTPS HTTP servers only: local PEM CA certificate/bundle, e.g. `"caFile": "~/certs/local-ca.pem"`. Replaces (does not add to) default roots for the resolved MCP origin. Supports environment interpolation and `~`; relative paths use the process working directory. Unreadable/invalid files fail closed; hostname and certificate-expiry verification remain enabled. |
 | `auth` | `"bearer"` or `"oauth"` |
 | `oauth.grantType` | `"authorization_code"` (default) or `"client_credentials"` for non-interactive machine auth |
 | `oauth.clientId` | Pre-registered OAuth client ID. MCP 2026 prefers pre-registered clients or Client ID Metadata Documents; this adapter falls back to Dynamic Client Registration when the ID is omitted and the server supports it. |
@@ -323,6 +324,10 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `debug` | Show server stderr (default: false) |
 | `trace` | Enable metadata-only JSONL protocol tracing for this server; payloads, prompts, tool arguments/results, authorization data, and URLs are never persisted |
 | `disabled` | Keep the server visible in config and status, but prevent connections, authentication, tools, and resource calls (only literal `true` disables it) |
+
+#### Custom HTTPS trust
+
+`caFile` works with Streamable HTTP, SSE, and per-request header commands. Requests using this trust reject all redirects; configure the final HTTPS endpoint directly. Other origins and servers retain default trust. Layered configuration drops inherited trust when replacing the URL or switching away from HTTP. This option covers the MCP origin, including connection-owned OAuth requests to that exact origin, but not the separate interactive OAuth flow or private-CA authorization servers on other origins. Thanks to [@desmonna](https://github.com/desmonna) for #527.
 
 #### Protocol version negotiation
 
@@ -352,7 +357,13 @@ Environment interpolation remains intentional. `${VAR}`, `$env:VAR`, and `{env:V
 
 For tighter use, configure a direct executable instead of npm/npx and avoid `!command` secret helpers. This option limits stdio child inheritance only; it does not provide complete multi-agent or helper-process isolation.
 
-Secret values in `headers`, `bearerToken`, `oauth.clientSecret`, and stdio `env` may use a leading `!command` to obtain their value at connection or authentication time. The command runs with stdin and stderr suppressed, stdout is limited to 1 MiB and trimmed, and it must finish within 10 seconds with non-empty output; failures stop the connection or authentication flow. Commands are not run during OAuth discovery or while reading, merging, previewing, hashing, or rendering configuration. Use `!!` to escape a literal leading `!`; ordinary and escaped values retain environment interpolation.
+With explicit `auth: "oauth"`, configured HTTP `headers` also accompany native OAuth metadata discovery (including `oauth.authServerMetadataUrl`), dynamic registration, code exchange, and refresh, **only at the configured MCP URL's origin** (scheme, host, and port). Discovered or explicitly configured cross-origin OAuth endpoints receive no configured service headers. SDK-owned headers such as OAuth `Authorization` and content types take precedence over configured `headers`. Requests carrying configured service headers reject all HTTP redirects, including same-origin redirects; configure the final endpoint directly. Browser authorization navigation and loopback callbacks do not use these headers. Missing or empty header credentials fail closed.
+
+`requestHeadersCommand` follows the fetch path, not the URL path: during a server connection, it wraps the SDK transport fetch (`requestFetch`), so it runs for MCP requests and SDK-owned OAuth requests using that fetch, including discovery, dynamic registration, token exchange (including `client_credentials`), and refresh. It also runs for cross-origin OAuth endpoints: unlike configured `headers`, command-produced headers are **not origin-scoped**. The command receives each request's exact method, URL, and body and must decide where its credentials belong. Its returned headers are applied last, overriding even SDK `Authorization` and content types on name collisions; avoid those names unless intentional.
+
+Provider-owned metadata loading through `authFetch` (notably `oauth.authServerMetadataUrl`) bypasses the command, even during a connection. Standalone OAuth start/complete/refresh helpers use their own OAuth fetch, not the transport wrapper, and also bypass it. Browser authorization navigation and loopback callbacks never invoke the command. Thus this is transport-fetch signing, not a hook for every OAuth interaction.
+
+Secret values in `headers`, `bearerToken`, `oauth.clientSecret`, and stdio `env` may use a leading `!command` to obtain their value at connection or authentication time. The command runs with stdin and stderr suppressed, stdout is limited to 1 MiB and trimmed, and it must finish within 10 seconds with non-empty output; failures stop the connection or authentication flow. Commands are not run during the preliminary MCP OAuth challenge probe or while reading, merging, previewing, hashing, or rendering configuration. OAuth header commands resolve lazily for the actual SDK backchannel requests, once per authentication leg or connection; the preliminary probe omits command headers. Use `!!` to escape a literal leading `!`; ordinary and escaped values retain environment interpolation.
 
 For local desktop bearer tokens, `bearerTokenStore: true` can opt in to the adapter-owned credential-store namespace. It never falls back to plaintext if the store is unavailable, if the stored record is malformed, or if the stored URL differs from the effective server URL. Literal tokens, command tokens, and environment tokens keep precedence so existing configs do not change. Create or rotate a stored token with `pi-mcp-adapter token set <server>` (masked prompt on a terminal, or piped stdin such as `security find-generic-password -s my-token -w | pi-mcp-adapter token set <server>`); the record binds to the effective configured URL at write time. Token commands need Node 22.18+.
 
@@ -450,13 +461,13 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `approveTools` | `true` to require approval before every MCP tool call, or an array of glob patterns such as `["github_delete_*", "notion_update_*"]`. Per-server `approveTools` overrides this. |
 | `oauthDir` | Legacy OAuth `tokens.json` import directory for this MCP config. Relative paths resolve from the active project cwd. `MCP_OAUTH_DIR` still wins when set. Persistent OAuth credentials are stored in the OS credential store, not this directory. |
 | `mcpServers.<name>.oauth.authorizationParams` | Extra authorization URL parameters for provider-specific OAuth extensions. Flow-owned parameters such as `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `response_type`, and `resource` cannot be overridden. |
-| `directTools` | Global default for all servers (default: false). Per-server overrides this. |
+| `directTools` | Global default for all servers (default: false). `true`, `false`, or `"search"`. Per-server overrides this. |
 | `strictDirectToolArguments` | Validate direct-tool inputs against their advertised schemas and recover one JSON string layer for object and array properties (default: false). |
 | `directToolResultDetails` | Direct-tool result details: `"lean"` (default) or `"bounded"` to retain the guarded raw MCP result. |
 | `warnOnLargeDirectTools` | Show the advisory when 75 or more direct tools resolve (default: `true`). Set to `false` to suppress only this advisory. |
 | `freezeDirectTools` | Keep direct-tool registration stable after the initial sync so metadata updates and explicit reconnects do not rebuild the system prompt. Proxy/search/cache metadata still refreshes. Default: false. |
 | `scriptMode` | Register the MCP-only `mcpScript` plain-JavaScript tool (default: true). Set to `false` to hide it. |
-| `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. |
+| `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. Ignored while any server uses `directTools: "search"`, whose tools are registered inactive and can only be activated through `mcp({ search })`. |
 | `autoAuth` | Auto-run OAuth on `connect`/tool calls when a server needs auth, then retry once (default: false). |
 | `sampling` | Allow MCP servers to sample through Pi models, honoring `modelPreferences.hints` before current/default fallback (default: true when UI approval is available). |
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
@@ -499,7 +510,7 @@ pi.events.on(MCP_TOOL_APPROVAL_REQUEST_EVENT, (request: McpToolApprovalRequest) 
 });
 ```
 
-The request includes `serverName`, `originalToolName`, `prefixedToolName`, `args`, `origin`, and optional `signal`. The first synchronous claim wins. `allow_for_session` updates the same session-scoped approval cache and persistence path as the built-in dialog; `deny` blocks the MCP call; `abstain` or no claim preserves the fallback behavior above. Brokered approval runs for every uncached MCP call regardless of `approveTools` configuration, across proxy, direct, `mcpScript`, resource, and iframe origins.
+The request includes `serverName`, `originalToolName`, `prefixedToolName`, `args`, `origin`, and optional `signal`. The first synchronous claim wins. Brokered approval runs for every resolved MCP call reaching the approval gate, including calls matching session grants restored from the active branch, regardless of `approveTools` configuration, across proxy, direct, `mcpScript`, resource, and iframe origins. `allow_once` permits only the current call; `allow_for_session` updates the same session-scoped approval cache and persistence path as the built-in dialog; `deny` blocks the current MCP call even if cached, without revoking its grant. Only `abstain` or no claim consults the cache, then the configured approval/UI fallback above if no matching grant exists. With no broker listener, fallback behavior is unchanged.
 
 ### Output Guard
 
@@ -633,6 +644,28 @@ To set a global default for all servers:
 ```
 
 Per-server `directTools` overrides the global setting. The example above registers direct tools for every server except `huge-server`.
+
+### Search-activated direct tools
+
+`directTools: true` puts every tool's definition in front of the model on every turn. Past a few dozen tools that costs context and, on smaller models, accuracy — the advisory at 75 exists for that reason. `directTools: "search"` is the middle path: the tools are registered as real direct tools with real schemas, but **inactive**, and `mcp({ search })` activates the matches additively.
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "directTools": "search"
+    }
+  }
+}
+```
+
+The process starts with only the `mcp` proxy (and any eager direct tools). When the model searches, matching tools from search-mode servers become active direct tools, reported on the result as `addedToolNames` so Pi treats that point as their load point. Subsequent turns in that process also see tools activated by earlier searches. What search activates are real tools with real schemas, not a proxy call.
+
+Activation is additive: the active set grows as searches match new tools and holds them for the life of the process. Bounding it is left to a later change.
+
+Activation happens at exactly one point: a successful `mcp({ search })` whose matches include the tool. Nothing else activates a search-mode tool — not a `mcp({ tool })` call, not a `connect`, not a session restart — and nothing deactivates one; the active set only grows within a process. Activation state lives in the running process: a new process (a restart, or a resumed session) starts with every search-mode tool held again until a search matches it, so the model may need to search once more after a resume. Selecting a server's tools eagerly (`directTools: true`, in config or from the `/mcp` panel) activates any of its tools that were held, and switching a server to `"search"` holds its tools again. The search result lists what it activated, and the search text follows unchanged. Search-mode tools do not count toward the 75-tool advisory.
 
 To expose only a subset of a noisy server, add `includeTools` on the server. Values can be exact original names, generated resource names such as `read_<resource>`, prefixed names, or simple glob patterns:
 

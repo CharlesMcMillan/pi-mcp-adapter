@@ -2,7 +2,7 @@
  * Tests for mcp-oauth-provider.ts - OAuth provider implementation
  */
 
-import { describe, it, before, after } from "node:test"
+import { describe, it, before, after, mock } from "node:test"
 import assert from "node:assert"
 import { existsSync, rmSync, mkdirSync, mkdtempSync, writeFileSync } from "fs"
 import { join } from "path"
@@ -837,4 +837,37 @@ describe("McpOAuthProvider", () => {
       assert.strictEqual((await staleProvider.tokens())?.access_token, "replacement-token")
     })
   })
+})
+
+it("runs runtime-bound transactions and configured discovery without AbortSignal.any", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, "any")
+  const runtime = new AbortController()
+  const provider = new McpOAuthProvider(`node20-${randomBytes(6).toString("hex")}`, "https://api.example", {
+    authServerMetadataUrl: "https://issuer.example/.well-known/oauth-authorization-server",
+  }, { onRedirect: async () => {} }, {}, runtime.signal)
+  let discoverySignal: AbortSignal | undefined
+  try {
+    Object.defineProperty(AbortSignal, "any", { configurable: true, value: undefined })
+    mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+      discoverySignal = init?.signal ?? undefined
+      return Response.json({
+        issuer: "https://issuer.example",
+        authorization_endpoint: "https://issuer.example/authorize",
+        token_endpoint: "https://issuer.example/token",
+        response_types_supported: ["code"],
+      })
+    })
+    assert.strictEqual(await provider.withAuthTransaction(async () => {
+      assert.strictEqual((await provider.discoveryState())?.authorizationServerMetadata?.issuer, "https://issuer.example")
+      return "AUTHORIZED"
+    }), "AUTHORIZED")
+    assert.ok(discoverySignal)
+    provider.deactivate()
+    assert.strictEqual(discoverySignal.aborted, true)
+  } finally {
+    mock.restoreAll()
+    if (descriptor) Object.defineProperty(AbortSignal, "any", descriptor)
+    else Reflect.deleteProperty(AbortSignal, "any")
+    provider.deactivate()
+  }
 })
